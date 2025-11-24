@@ -9,7 +9,7 @@ import torch.nn as nn
 import numpy as np
 from skimage.draw import polygon
 from torchmetrics import Metric
-from ..occ_head_plugin import calculate_birds_eye_view_parameters, gen_dx_bx
+from .occ_head_plugin import calculate_birds_eye_view_parameters, gen_dx_bx
 
 
 class PlanningMetric(Metric):

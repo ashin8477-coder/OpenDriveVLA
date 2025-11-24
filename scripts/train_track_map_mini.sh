@@ -7,9 +7,27 @@ GLOBAL_RANK=${GLOBAL_RANK:-0}
 
 set -e
 
+# Resolve repository root and ensure PYTHONPATH includes it.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${REPO_ROOT}"
+cd "${REPO_ROOT}"
+
 # Default environment overrides (can still be overridden by caller).
 PYTHON_BIN=${PYTHON_BIN:-python3}
 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+
+# Resolve an actual python executable for helper snippets.
+if command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  PYTHON_EXEC="${PYTHON_BIN}"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_EXEC="python3"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_EXEC="python"
+else
+  echo "[ERROR] 无法找到可用的 Python 解释器，请设置 PYTHON_BIN。" 1>&2
+  exit 1
+fi
 
 # Values injected by the platform (fallbacks provided for local runs).
 NUM_GPUS=${KUBERNETES_POD_GPU_COUNT:-${NUM_GPUS:-2}}
@@ -20,9 +38,65 @@ MASTER_PORT=${MASTER_PORT:-29500}
 
 CONFIG="projects/configs/stage1_track_map/base_track_map.py"
 
-DATA_ROOT=${DATA_ROOT:-/workspace/OpenDriveVLA/volume/data}
+# Allow overriding via either DATA_ROOT/INFO_ROOT or legacy ODVLA_* vars.
+DATA_ROOT=${DATA_ROOT:-${ODVLA_DATA_ROOT:-/workspace/OpenDriveVLA/volume/data}}
+INFO_ROOT=${INFO_ROOT:-${ODVLA_INFO_ROOT:-${DATA_ROOT}/infos_mini}}
 NUSCENES_ROOT="${DATA_ROOT}/nuscenes"
-INFO_ROOT=${INFO_ROOT:-${DATA_ROOT}/infos_mini}
+
+# Attempt to auto-resolve common dataset locations if defaults are missing.
+if [ ! -d "${NUSCENES_ROOT}" ]; then
+  for candidate in \
+    "/dataset/vla-11-data/v1.0.0/dataset/data" \
+    "/dataset/vla-1.0.0/dataset/data" \
+    "/workspace/dataset/data"; do
+    if [ -d "${candidate}/nuscenes" ]; then
+      DATA_ROOT="${candidate}"
+      NUSCENES_ROOT="${DATA_ROOT}/nuscenes"
+      break
+    fi
+  done
+fi
+
+if [ ! -d "${INFO_ROOT}" ] || [ ! -f "${INFO_ROOT}/nuscenes_infos_temporal_train.pkl" ]; then
+  for candidate in \
+    "${DATA_ROOT}/infos_mini" \
+    "/dataset/vla-11-data/v1.0.0/dataset/data/infos_mini" \
+    "/dataset/vla-1.0.0/dataset/data/infos_mini"; do
+    if [ -f "${candidate}/nuscenes_infos_temporal_train.pkl" ]; then
+      INFO_ROOT="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [ ! -d "${NUSCENES_ROOT}" ]; then
+  echo "[ERROR] 找不到 nuScenes 数据目录: ${NUSCENES_ROOT}" 1>&2
+  echo "请设置 DATA_ROOT 或 ODVLA_DATA_ROOT 环境变量指向包含 nuscenes/ 的目录。" 1>&2
+  exit 1
+fi
+
+if [ ! -f "${INFO_ROOT}/nuscenes_infos_temporal_train.pkl" ]; then
+  echo "[ERROR] 找不到 infos_mini 数据: ${INFO_ROOT}/nuscenes_infos_temporal_train.pkl" 1>&2
+  echo "请设置 INFO_ROOT 或 ODVLA_INFO_ROOT，或检查 infos_mini 目录是否正确。" 1>&2
+  exit 1
+fi
+
+CKPT_PATH=${CKPT_PATH:-${REPO_ROOT}/ckpts/bevformer_r101_dcn_24ep.pth}
+if [ ! -f "${CKPT_PATH}" ]; then
+  for candidate in \
+    "${REPO_ROOT}/../OpenDriveVLA-main/ckpts/bevformer_r101_dcn_24ep.pth" \
+    "${REPO_ROOT}/../ckpts/bevformer_r101_dcn_24ep.pth"; do
+    if [ -f "${candidate}" ]; then
+      CKPT_PATH="${candidate}"
+      break
+    fi
+  done
+fi
+
+if [ ! -f "${CKPT_PATH}" ]; then
+  echo "[ERROR] 找不到预训练权重 ckpts/bevformer_r101_dcn_24ep.pth，请设置 CKPT_PATH 指向实际文件。" 1>&2
+  exit 1
+fi
 
 WORK_DIR=${WORK_DIR:-/workspace/OpenDriveVLA/outputs/track_map_mini}
 
@@ -35,6 +109,29 @@ fi
 
 # torchrun will launch NUM_GPUS processes on each node.
 # Total world size = NUM_NODES * NUM_GPUS.
+# If只有一张GPU可用时自动退为单卡训练。
+if [ "${NUM_GPUS}" -gt 1 ]; then
+  AVAILABLE_GPUS=$("${PYTHON_EXEC}" - <<'PY'
+import os
+import subprocess
+try:
+    import torch
+    print(torch.cuda.device_count())
+except Exception:
+    try:
+        out = subprocess.check_output(["nvidia-smi", "-L"], stderr=subprocess.DEVNULL).decode().strip()
+        print(len([line for line in out.splitlines() if line.strip()]))
+    except Exception:
+        print(0)
+PY
+)
+  if [ "${AVAILABLE_GPUS}" -lt "${NUM_GPUS}" ]; then
+    echo "[WARN] 检测到可用 GPU 数 (${AVAILABLE_GPUS}) 少于 NUM_GPUS=${NUM_GPUS}，自动降为单卡训练。" 1>&2
+    NUM_GPUS=1
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*}
+  fi
+fi
+
 "${TORCHRUN_CMD[@]}" \
   --nproc_per_node=${NUM_GPUS} \
   --nnodes=${NUM_NODES} \
@@ -60,5 +157,6 @@ fi
     data.train.data_root=${NUSCENES_ROOT} \
     data.val.data_root=${NUSCENES_ROOT} \
     data.test.data_root=${NUSCENES_ROOT} \
+    load_from=${CKPT_PATH} \
     work_dir=${WORK_DIR}
 
