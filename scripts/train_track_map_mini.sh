@@ -10,7 +10,10 @@ set -e
 # Resolve repository root and ensure PYTHONPATH includes it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${REPO_ROOT}"
+case ":${PYTHONPATH:-}:" in
+  *":${REPO_ROOT}:"*) ;;
+  *) export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}";;
+esac
 cd "${REPO_ROOT}"
 
 # Default environment overrides (can still be overridden by caller).
@@ -38,8 +41,11 @@ MASTER_PORT=${MASTER_PORT:-29500}
 
 CONFIG="projects/configs/stage1_track_map/base_track_map.py"
 
-# Allow overriding via either DATA_ROOT/INFO_ROOT or legacy ODVLA_* vars.
-DATA_ROOT=${DATA_ROOT:-${ODVLA_DATA_ROOT:-/workspace/OpenDriveVLA/volume/data}}
+# Default volume root (can be overridden)
+VOLUME_ROOT=${VOLUME_ROOT:-/workspace/dataset}
+
+# Allow overriding via env vars, otherwise fall back to mounted volume layout.
+DATA_ROOT=${DATA_ROOT:-${ODVLA_DATA_ROOT:-${VOLUME_ROOT}/vla-11-data/v1.0.0/dataset/data}}
 INFO_ROOT=${INFO_ROOT:-${ODVLA_INFO_ROOT:-${DATA_ROOT}/infos_mini}}
 NUSCENES_ROOT="${DATA_ROOT}/nuscenes"
 
@@ -84,6 +90,7 @@ fi
 CKPT_PATH=${CKPT_PATH:-${REPO_ROOT}/ckpts/bevformer_r101_dcn_24ep.pth}
 if [ ! -f "${CKPT_PATH}" ]; then
   for candidate in \
+    "${VOLUME_ROOT}/ckpts/bevformer_r101_dcn_24ep.pth" \
     "${REPO_ROOT}/../OpenDriveVLA-main/ckpts/bevformer_r101_dcn_24ep.pth" \
     "${REPO_ROOT}/../ckpts/bevformer_r101_dcn_24ep.pth"; do
     if [ -f "${candidate}" ]; then
@@ -109,10 +116,7 @@ fi
 
 # torchrun will launch NUM_GPUS processes on each node.
 # Total world size = NUM_NODES * NUM_GPUS.
-# If只有一张GPU可用时自动退为单卡训练。
-if [ "${NUM_GPUS}" -gt 1 ]; then
-  AVAILABLE_GPUS=$("${PYTHON_EXEC}" - <<'PY'
-import os
+AVAILABLE_GPUS=$("${PYTHON_EXEC}" - <<'PY'
 import subprocess
 try:
     import torch
@@ -125,38 +129,65 @@ except Exception:
         print(0)
 PY
 )
-  if [ "${AVAILABLE_GPUS}" -lt "${NUM_GPUS}" ]; then
-    echo "[WARN] 检测到可用 GPU 数 (${AVAILABLE_GPUS}) 少于 NUM_GPUS=${NUM_GPUS}，自动降为单卡训练。" 1>&2
-    NUM_GPUS=1
-    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*}
-  fi
+
+if [ "${AVAILABLE_GPUS}" -lt 1 ]; then
+  echo "[ERROR] 未检测到可用 GPU。当前训练脚本要求至少一张 GPU。" 1>&2
+  exit 1
 fi
 
-"${TORCHRUN_CMD[@]}" \
-  --nproc_per_node=${NUM_GPUS} \
-  --nnodes=${NUM_NODES} \
-  --node_rank=${NODE_RANK} \
-  --master_addr=${MASTER_ADDR} \
-  --master_port=${MASTER_PORT} \
-  third_party/mmdetection3d_1_0_0rc6/tools/train.py \
-  ${CONFIG} \
-  --launcher pytorch \
-  --cfg-options \
-    data.samples_per_gpu=1 \
-    data.workers_per_gpu=0 \
-    data_root=${NUSCENES_ROOT} \
-    info_root=${INFO_ROOT} \
-    train_pipeline.0.img_root=${NUSCENES_ROOT} \
-    test_pipeline.0.img_root=${NUSCENES_ROOT} \
-    data.train.pipeline.0.img_root=${NUSCENES_ROOT} \
-    data.val.pipeline.0.img_root=${NUSCENES_ROOT} \
-    data.test.pipeline.0.img_root=${NUSCENES_ROOT} \
-    data.train.ann_file=${INFO_ROOT}/nuscenes_infos_temporal_train.pkl \
-    data.val.ann_file=${INFO_ROOT}/nuscenes_infos_temporal_val.pkl \
-    data.test.ann_file=${INFO_ROOT}/nuscenes_infos_temporal_val.pkl \
-    data.train.data_root=${NUSCENES_ROOT} \
-    data.val.data_root=${NUSCENES_ROOT} \
-    data.test.data_root=${NUSCENES_ROOT} \
-    load_from=${CKPT_PATH} \
-    work_dir=${WORK_DIR}
+if [ "${AVAILABLE_GPUS}" -lt "${NUM_GPUS}" ]; then
+  echo "[WARN] 检测到可用 GPU 数 (${AVAILABLE_GPUS}) 少于 NUM_GPUS=${NUM_GPUS}，自动降为单卡训练。" 1>&2
+  NUM_GPUS=1
+fi
+
+if [ "${NUM_GPUS}" -eq 1 ]; then
+  # 保留一个 GPU，避免 torch.distributed 额外开销。
+  if [[ "${CUDA_VISIBLE_DEVICES}" == *,* ]]; then
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES%%,*}
+  fi
+  export CUDA_VISIBLE_DEVICES
+  DEVICE_IDS="[0]"
+  LAUNCHER_OPT="--launcher none"
+else
+  DEVICE_IDS="[0,$(seq -s, 1 $((NUM_GPUS-1)))]"
+  LAUNCHER_OPT="--launcher pytorch"
+fi
+
+COMMON_CFG_OPTS=(
+  data.samples_per_gpu=1
+  data.workers_per_gpu=0
+  data_root=${NUSCENES_ROOT}
+  info_root=${INFO_ROOT}
+  train_pipeline.0.img_root=${NUSCENES_ROOT}
+  test_pipeline.0.img_root=${NUSCENES_ROOT}
+  data.train.pipeline.0.img_root=${NUSCENES_ROOT}
+  data.val.pipeline.0.img_root=${NUSCENES_ROOT}
+  data.test.pipeline.0.img_root=${NUSCENES_ROOT}
+  data.train.ann_file=${INFO_ROOT}/nuscenes_infos_temporal_train.pkl
+  data.val.ann_file=${INFO_ROOT}/nuscenes_infos_temporal_val.pkl
+  data.test.ann_file=${INFO_ROOT}/nuscenes_infos_temporal_val.pkl
+  data.train.data_root=${NUSCENES_ROOT}
+  data.val.data_root=${NUSCENES_ROOT}
+  data.test.data_root=${NUSCENES_ROOT}
+  load_from=${CKPT_PATH}
+  work_dir=${WORK_DIR}
+)
+
+if [ "${NUM_GPUS}" -gt 1 ]; then
+  "${TORCHRUN_CMD[@]}" \
+    --nproc_per_node=${NUM_GPUS} \
+    --nnodes=${NUM_NODES} \
+    --node_rank=${NODE_RANK} \
+    --master_addr=${MASTER_ADDR} \
+    --master_port=${MASTER_PORT} \
+    third_party/mmdetection3d_1_0_0rc6/tools/train.py \
+    ${CONFIG} \
+    --launcher pytorch \
+    --cfg-options "${COMMON_CFG_OPTS[@]}"
+else
+  "${PYTHON_EXEC}" \
+    third_party/mmdetection3d_1_0_0rc6/tools/train.py \
+    ${CONFIG} \
+    --cfg-options "${COMMON_CFG_OPTS[@]}" launcher="none"
+fi
 
